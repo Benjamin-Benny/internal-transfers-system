@@ -2,9 +2,12 @@ package repo
 
 import (
 	"context"
+	"errors"
+	"math/rand"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
@@ -121,7 +124,7 @@ func TestTransferTxSuccess(t *testing.T) {
 	sourceAccount, err := repo.GetAccount(ctx, sourceID)
 	require.NoError(t, err)
 	expectedSourceBalance := sourceBalance.Sub(transferAmount)
-	assert.True(t, expectedSourceBalance.Equal(sourceAccount.Balance), 
+	assert.True(t, expectedSourceBalance.Equal(sourceAccount.Balance),
 		"source balance should be %s, got %s", expectedSourceBalance.String(), sourceAccount.Balance.String())
 
 	// Verify destination balance
@@ -133,7 +136,7 @@ func TestTransferTxSuccess(t *testing.T) {
 
 	// Verify transaction log entry exists
 	var count int
-	err = repo.pool.QueryRow(ctx, 
+	err = repo.pool.QueryRow(ctx,
 		"SELECT COUNT(*) FROM transactions WHERE source_account_id = $1 AND destination_account_id = $2",
 		sourceID, destID).Scan(&count)
 	require.NoError(t, err)
@@ -272,7 +275,7 @@ func TestTransferTxConcurrency(t *testing.T) {
 
 	// Get initial transaction count for these accounts
 	var initialTxCount int
-	err = repo.pool.QueryRow(ctx, 
+	err = repo.pool.QueryRow(ctx,
 		"SELECT COUNT(*) FROM transactions WHERE (source_account_id = $1 AND destination_account_id = $2) OR (source_account_id = $2 AND destination_account_id = $1)",
 		sourceID, destID).Scan(&initialTxCount)
 	require.NoError(t, err)
@@ -309,7 +312,7 @@ func TestTransferTxConcurrency(t *testing.T) {
 
 	// Count successful transfers for these specific accounts
 	var finalTxCount int
-	err = repo.pool.QueryRow(ctx, 
+	err = repo.pool.QueryRow(ctx,
 		"SELECT COUNT(*) FROM transactions WHERE source_account_id = $1 AND destination_account_id = $2",
 		sourceID, destID).Scan(&finalTxCount)
 	require.NoError(t, err)
@@ -324,32 +327,32 @@ func TestTransferTxConcurrency(t *testing.T) {
 	// Assert: final source balance = initial - (N * amount)
 	expectedSourceBalance := initialSourceBalance.Sub(transferAmount.Mul(decimal.NewFromInt(N)))
 	assert.True(t, expectedSourceBalance.Equal(sourceAccount.Balance),
-		"source balance should be initial - (N * amount): expected %s (1000 - %d*10), got %s", 
+		"source balance should be initial - (N * amount): expected %s (1000 - %d*10), got %s",
 		expectedSourceBalance.String(), N, sourceAccount.Balance.String())
 
 	// Assert: final dest balance = initial + (N * amount)
 	expectedDestBalance := initialDestBalance.Add(transferAmount.Mul(decimal.NewFromInt(N)))
 	assert.True(t, expectedDestBalance.Equal(destAccount.Balance),
-		"dest balance should be initial + (N * amount): expected %s (0 + %d*10), got %s", 
+		"dest balance should be initial + (N * amount): expected %s (0 + %d*10), got %s",
 		expectedDestBalance.String(), N, destAccount.Balance.String())
 
 	// Assert: total money conserved (sum of both accounts unchanged)
 	totalBalance := sourceAccount.Balance.Add(destAccount.Balance)
 	expectedTotal := initialSourceBalance.Add(initialDestBalance)
 	assert.True(t, expectedTotal.Equal(totalBalance),
-		"total money should be conserved: expected %s, got %s", 
+		"total money should be conserved: expected %s, got %s",
 		expectedTotal.String(), totalBalance.String())
 
 	// Additional safety check: source should never be negative
-	assert.False(t, sourceAccount.Balance.IsNegative(), 
+	assert.False(t, sourceAccount.Balance.IsNegative(),
 		"source balance should never be negative, got %s", sourceAccount.Balance.String())
 
 	t.Logf("Successfully completed all %d concurrent transfers", successfulTransfers)
-	t.Logf("Source: %s -> %s (decreased by %s)", 
-		initialSourceBalance.String(), sourceAccount.Balance.String(), 
+	t.Logf("Source: %s -> %s (decreased by %s)",
+		initialSourceBalance.String(), sourceAccount.Balance.String(),
 		initialSourceBalance.Sub(sourceAccount.Balance).String())
-	t.Logf("Dest: %s -> %s (increased by %s)", 
-		initialDestBalance.String(), destAccount.Balance.String(), 
+	t.Logf("Dest: %s -> %s (increased by %s)",
+		initialDestBalance.String(), destAccount.Balance.String(),
 		destAccount.Balance.Sub(initialDestBalance).String())
 }
 
@@ -369,4 +372,188 @@ func TestCreateAccountValidation(t *testing.T) {
 	// Test negative balance
 	err = repo.CreateAccount(ctx, 9001, decimal.NewFromFloat(-100))
 	assert.ErrorIs(t, err, ErrInvalidAmount, "should reject negative balance")
+}
+
+// Why ReadCommitted + FOR UPDATE is sufficient for these tests (and for the money engine):
+//
+// Every TransferTx does `SELECT ... FOR UPDATE` on BOTH account rows before reading their
+// balances, so it holds a row-level write lock across the whole check-funds -> debit -> credit
+// sequence. Under READ COMMITTED, a statement sees the latest *committed* data, and FOR UPDATE
+// blocks any other transaction from reading-for-update or writing those same rows until we
+// commit or roll back. That serializes the read-modify-write per account: no lost updates, no
+// dirty reads. We do NOT need SERIALIZABLE because a transfer never makes a decision over a
+// *set* of rows that could change underneath it (no phantom/range problem) — it touches exactly
+// two explicitly locked rows. Finally, locking the lower account id first gives every transfer
+// the same global lock order, so concurrent transfers can never form a lock cycle => no DB
+// deadlock. These two tests exercise exactly those guarantees under real concurrency.
+
+// TestTransferConcurrencyMoneyIntegrity is the strongest statement we can make about the money
+// engine: under heavy concurrent load it must neither create nor destroy value, and it must
+// never let an account go negative — with no application- or database-level deadlock.
+func TestTransferConcurrencyMoneyIntegrity(t *testing.T) {
+	repo, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const (
+		numAccounts = 10  // K accounts to spread contention across
+		numWorkers  = 200 // N concurrent transfers
+	)
+
+	// Seed K accounts with a known balance and record the exact starting total. Because
+	// transfers only ever move value *between* these accounts, this total is the invariant.
+	initialBalance := decimal.NewFromInt(1000).Truncate(5)
+	accountIDs := make([]int64, numAccounts)
+	expectedTotal := decimal.Zero
+	for i := 0; i < numAccounts; i++ {
+		id := int64(20000 + i)
+		accountIDs[i] = id
+		require.NoError(t, repo.CreateAccount(ctx, id, initialBalance))
+		expectedTotal = expectedTotal.Add(initialBalance)
+	}
+
+	// Launch N goroutines, each doing one random source->dest transfer of a random valid
+	// amount. A WaitGroup lets us join them; a buffered channel collects only *unexpected*
+	// errors — insufficient_funds is a legitimate business outcome (a source can be drained
+	// by concurrent transfers), so it must NOT fail the test.
+	var wg sync.WaitGroup
+	unexpected := make(chan error, numWorkers)
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerSeed int64) {
+			defer wg.Done()
+			// Per-goroutine RNG: avoids the global rand mutex and any data race.
+			rng := rand.New(rand.NewSource(workerSeed))
+
+			// Pick two DISTINCT accounts so we exercise the transfer path, not ErrSameAccount.
+			si := rng.Intn(numAccounts)
+			di := rng.Intn(numAccounts - 1)
+			if di >= si {
+				di++
+			}
+			// Random valid amount in [0.01, 100.00]: decimal.New(v, -2) => v * 10^-2, so at
+			// most 2 decimal places (well within the 5-place contract).
+			amount := decimal.New(rng.Int63n(10000)+1, -2)
+
+			err := repo.TransferTx(ctx, accountIDs[si], accountIDs[di], amount)
+			switch {
+			case err == nil:
+				// success
+			case errors.Is(err, ErrInsufficientFunds):
+				// expected business error under contention — tolerated
+			default:
+				unexpected <- err
+			}
+		}(int64(i) + 1)
+	}
+
+	// Join with a timeout so an *application-level* deadlock (goroutines blocked forever)
+	// surfaces as an explicit failure instead of hanging the whole suite.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for transfers — likely a deadlock (application-level or DB)")
+	}
+	close(unexpected)
+
+	// Assertion (c): NO unexpected error. A Postgres deadlock (SQLSTATE 40P01) would arrive
+	// here as a non-nil, non-insufficient-funds error — deterministic lock ordering is what
+	// keeps this channel empty.
+	for err := range unexpected {
+		t.Errorf("unexpected transfer error (a DB deadlock or corruption would surface here): %v", err)
+	}
+
+	total := decimal.Zero
+	for _, id := range accountIDs {
+		acc, err := repo.GetAccount(ctx, id)
+		require.NoError(t, err)
+		// Assertion (b): NO negative balance. Protected by the in-transaction funds check on
+		// the FOR UPDATE-locked row AND, as a backstop, the CHECK (balance >= 0) constraint.
+		assert.False(t, acc.Balance.IsNegative(), "account %d went negative: %s", id, acc.Balance.String())
+		total = total.Add(acc.Balance)
+	}
+
+	// Assertion (a): CONSERVATION. Value only moved between seeded accounts, so the sum of all
+	// balances must exactly equal the recorded starting total, regardless of how many transfers
+	// succeeded or hit insufficient_funds.
+	assert.True(t, expectedTotal.Equal(total),
+		"money not conserved: started with %s, ended with %s", expectedTotal.String(), total.String())
+
+	t.Logf("integrity holds: total conserved at %s across %d accounts and %d concurrent transfers; no negative balances; no deadlock",
+		total.String(), numAccounts, numWorkers)
+}
+
+// TestTransferDeadlockOrdering is the tight, targeted proof that deterministic lock ordering
+// works: two accounts transferring to each other in OPPOSITE directions at the same time is the
+// classic deadlock setup. Because TransferTx always locks the lower id first, both directions
+// acquire locks in the same order and can never form a cycle. Without that ordering this test
+// would intermittently hang on a Postgres deadlock; with it, it completes cleanly.
+func TestTransferDeadlockOrdering(t *testing.T) {
+	repo, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	a := int64(21001)
+	b := int64(21002)
+	// Large starting balances so neither side runs dry — we want to test locking, not funds.
+	start := decimal.NewFromInt(1000000).Truncate(5)
+	require.NoError(t, repo.CreateAccount(ctx, a, start))
+	require.NoError(t, repo.CreateAccount(ctx, b, start))
+
+	const iterations = 300
+	amount := decimal.NewFromInt(1).Truncate(5)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*iterations)
+
+	wg.Add(2)
+	go func() { // A -> B, repeatedly
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			if err := repo.TransferTx(ctx, a, b, amount); err != nil && !errors.Is(err, ErrInsufficientFunds) {
+				errs <- err
+			}
+		}
+	}()
+	go func() { // B -> A, repeatedly — opposite direction, simultaneously
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			if err := repo.TransferTx(ctx, b, a, amount); err != nil && !errors.Is(err, ErrInsufficientFunds) {
+				errs <- err
+			}
+		}
+	}()
+
+	// Timeout guard: if the ordering were wrong, the two goroutines would deadlock and this
+	// WaitGroup would never complete — the timeout converts that hang into a clear failure.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("A<->B transfers timed out — deterministic lock ordering is not preventing deadlock")
+	}
+	close(errs)
+
+	// Any error here (in particular a Postgres deadlock, SQLSTATE 40P01) means ordering failed.
+	for err := range errs {
+		t.Errorf("unexpected error during A<->B contention (a DB deadlock would surface here): %v", err)
+	}
+
+	// Conservation must still hold under bidirectional contention.
+	accA, err := repo.GetAccount(ctx, a)
+	require.NoError(t, err)
+	accB, err := repo.GetAccount(ctx, b)
+	require.NoError(t, err)
+	got := accA.Balance.Add(accB.Balance)
+	want := start.Add(start)
+	assert.True(t, want.Equal(got),
+		"money not conserved under A<->B contention: want %s, got %s", want.String(), got.String())
+
+	t.Logf("A<->B ran %d iterations each direction with no deadlock; total conserved at %s", iterations, got.String())
 }
