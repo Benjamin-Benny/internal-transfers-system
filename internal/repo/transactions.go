@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -36,7 +37,8 @@ func (r *Repo) TransferTx(ctx context.Context, sourceID, destID int64, amount de
 	query := `SELECT account_id, balance FROM accounts WHERE account_id = $1 FOR UPDATE`
 	err = tx.QueryRow(ctx, query, firstID).Scan(&firstAccountID, &firstBalanceStr)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		// errors.Is (not ==) so a wrapped ErrNoRows still maps to 404, not a generic 500
+		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrAccountNotFound
 		}
 		return fmt.Errorf("failed to lock account %d: %w", firstID, err)
@@ -47,7 +49,8 @@ func (r *Repo) TransferTx(ctx context.Context, sourceID, destID int64, amount de
 	var secondBalanceStr string
 	err = tx.QueryRow(ctx, query, secondID).Scan(&secondAccountID, &secondBalanceStr)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		// errors.Is (not ==) so a wrapped ErrNoRows still maps to 404, not a generic 500
+		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrAccountNotFound
 		}
 		return fmt.Errorf("failed to lock account %d: %w", secondID, err)
@@ -62,7 +65,7 @@ func (r *Repo) TransferTx(ctx context.Context, sourceID, destID int64, amount de
 		destBalanceStr = firstBalanceStr
 	}
 
-	// Parse balances
+	// Parse balances; a malformed DB NUMERIC must abort the transfer, never silently become zero
 	sourceBalance, err := decimal.NewFromString(sourceBalanceStr)
 	if err != nil {
 		return fmt.Errorf("failed to parse source balance: %w", err)

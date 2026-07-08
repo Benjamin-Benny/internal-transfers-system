@@ -97,6 +97,8 @@ func TestCreateAccount(t *testing.T) {
 			{"invalid format", "not-a-number"},
 			{"empty string", ""},
 			{"special chars", "100.00$"},
+			// scientific notation must be rejected here too, for parity with the transfer amount path
+			{"scientific notation", "1e5"},
 		}
 
 		for _, tc := range testCases {
