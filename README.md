@@ -54,17 +54,16 @@ go mod download
 # 2. Start PostgreSQL
 make db-up
 
-# 3. Configure environment
-cp .env.example .env
-
-# 4. Run migrations
+# 3. Run migrations (Make auto-creates .env from .env.example on first run)
 make migrate-up
 
-# 5. Start server
+# 4. Start server
 make run
 ```
 
-The server runs on `http://localhost:8080` by default.
+The `make` targets load `.env` and create it from `.env.example` automatically the first time,
+so no manual setup is needed. To customize configuration, edit `.env` (or copy it yourself with
+`cp .env.example .env` before editing). The server runs on `http://localhost:8080` by default.
 
 ## Makefile Commands
 

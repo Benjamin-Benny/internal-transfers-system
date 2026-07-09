@@ -1,3 +1,10 @@
+# Load .env for local dev so every target sees DATABASE_URL; production uses real injected env vars.
+ifeq (,$(wildcard .env))
+$(shell cp .env.example .env 2>/dev/null)
+endif
+-include .env
+export
+
 .PHONY: run test tidy db-up db-down migrate-up migrate-down migrate-verify help
 
 # Default target
