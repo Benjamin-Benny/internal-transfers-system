@@ -31,7 +31,9 @@ func setupTestRepo(t *testing.T) (*Repo, func()) {
 	pool, err := pgxpool.New(ctx, databaseURL)
 	require.NoError(t, err, "failed to connect to database")
 
-	// Clean tables before test
+	// Clean tables before test (idempotency_keys first: it FKs to transactions)
+	_, err = pool.Exec(ctx, "DELETE FROM idempotency_keys")
+	require.NoError(t, err, "failed to clean idempotency_keys table")
 	_, err = pool.Exec(ctx, "DELETE FROM transactions")
 	require.NoError(t, err, "failed to clean transactions table")
 	_, err = pool.Exec(ctx, "DELETE FROM accounts")
@@ -556,4 +558,92 @@ func TestTransferDeadlockOrdering(t *testing.T) {
 		"money not conserved under A<->B contention: want %s, got %s", want.String(), got.String())
 
 	t.Logf("A<->B ran %d iterations each direction with no deadlock; total conserved at %s", iterations, got.String())
+}
+
+// helpers for the idempotency tests
+func txCount(t *testing.T, repo *Repo, src, dst int64) int {
+	t.Helper()
+	var n int
+	err := repo.pool.QueryRow(context.Background(),
+		"SELECT COUNT(*) FROM transactions WHERE source_account_id = $1 AND destination_account_id = $2",
+		src, dst).Scan(&n)
+	require.NoError(t, err)
+	return n
+}
+
+// TestTransferTxIdempotent_FirstCall: a brand-new key performs the transfer once and returns the
+// ledger id, and exactly one transactions row is written.
+func TestTransferTxIdempotent_FirstCall(t *testing.T) {
+	repo, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	src, dst := int64(22001), int64(22002)
+	require.NoError(t, repo.CreateAccount(ctx, src, decimal.NewFromInt(1000).Truncate(5)))
+	require.NoError(t, repo.CreateAccount(ctx, dst, decimal.NewFromInt(0).Truncate(5)))
+
+	amount := decimal.NewFromInt(250).Truncate(5)
+	id, err := repo.TransferTxIdempotent(ctx, src, dst, amount, "key-first")
+	require.NoError(t, err)
+	assert.Greater(t, id, int64(0), "should return the new transaction id")
+
+	srcAcc, _ := repo.GetAccount(ctx, src)
+	dstAcc, _ := repo.GetAccount(ctx, dst)
+	assert.True(t, decimal.NewFromInt(750).Equal(srcAcc.Balance), "source should be debited once, got %s", srcAcc.Balance)
+	assert.True(t, decimal.NewFromInt(250).Equal(dstAcc.Balance), "dest should be credited once, got %s", dstAcc.Balance)
+	assert.Equal(t, 1, txCount(t, repo, src, dst), "exactly one ledger row")
+}
+
+// TestTransferTxIdempotent_ExactDuplicateRetry: replaying the SAME key and payload returns the
+// SAME id and moves no additional money — the core "retry never double-applies" guarantee.
+func TestTransferTxIdempotent_ExactDuplicateRetry(t *testing.T) {
+	repo, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	src, dst := int64(23001), int64(23002)
+	require.NoError(t, repo.CreateAccount(ctx, src, decimal.NewFromInt(1000).Truncate(5)))
+	require.NoError(t, repo.CreateAccount(ctx, dst, decimal.NewFromInt(0).Truncate(5)))
+
+	amount := decimal.NewFromInt(250).Truncate(5)
+
+	id1, err := repo.TransferTxIdempotent(ctx, src, dst, amount, "key-dup")
+	require.NoError(t, err)
+
+	// Retry the exact same request several times.
+	for i := 0; i < 3; i++ {
+		id2, err := repo.TransferTxIdempotent(ctx, src, dst, amount, "key-dup")
+		require.NoError(t, err, "retry %d should succeed", i)
+		assert.Equal(t, id1, id2, "retry must return the original transaction id")
+	}
+
+	srcAcc, _ := repo.GetAccount(ctx, src)
+	dstAcc, _ := repo.GetAccount(ctx, dst)
+	assert.True(t, decimal.NewFromInt(750).Equal(srcAcc.Balance), "money moved only once (source), got %s", srcAcc.Balance)
+	assert.True(t, decimal.NewFromInt(250).Equal(dstAcc.Balance), "money moved only once (dest), got %s", dstAcc.Balance)
+	assert.Equal(t, 1, txCount(t, repo, src, dst), "still exactly one ledger row after retries")
+}
+
+// TestTransferTxIdempotent_ConflictingPayload: the same key with a DIFFERENT payload is rejected
+// with ErrIdempotencyKeyConflict and no money is moved for the second request.
+func TestTransferTxIdempotent_ConflictingPayload(t *testing.T) {
+	repo, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	src, dst := int64(24001), int64(24002)
+	require.NoError(t, repo.CreateAccount(ctx, src, decimal.NewFromInt(1000).Truncate(5)))
+	require.NoError(t, repo.CreateAccount(ctx, dst, decimal.NewFromInt(0).Truncate(5)))
+
+	_, err := repo.TransferTxIdempotent(ctx, src, dst, decimal.NewFromInt(250).Truncate(5), "key-conflict")
+	require.NoError(t, err)
+
+	// Same key, different amount -> conflict.
+	_, err = repo.TransferTxIdempotent(ctx, src, dst, decimal.NewFromInt(999).Truncate(5), "key-conflict")
+	assert.ErrorIs(t, err, ErrIdempotencyKeyConflict, "reused key with a different payload must conflict")
+
+	// The conflicting request moved no money; only the original transfer stands.
+	srcAcc, _ := repo.GetAccount(ctx, src)
+	assert.True(t, decimal.NewFromInt(750).Equal(srcAcc.Balance), "conflict must not move money, got %s", srcAcc.Balance)
+	assert.Equal(t, 1, txCount(t, repo, src, dst), "conflict must not add a ledger row")
 }

@@ -29,7 +29,8 @@ import (
 // - JSON serialization/deserialization
 //
 // To run:
-//   RUN_INTEGRATION=1 DATABASE_URL="postgres://user:pass@localhost:5432/dbname" go test ./internal/http -v -run TestHTTPIntegration
+//
+//	RUN_INTEGRATION=1 DATABASE_URL="postgres://user:pass@localhost:5432/dbname" go test ./internal/http -v -run TestHTTPIntegration
 //
 // Note: This test is optional. The handler unit tests and repo integration tests
 // provide sufficient coverage. This test is useful for validating the full stack
@@ -51,7 +52,9 @@ func TestHTTPIntegration(t *testing.T) {
 	require.NoError(t, err, "failed to connect to database")
 	defer pool.Close()
 
-	// Clean tables before test
+	// Clean tables before test (idempotency_keys first: it FKs to transactions)
+	_, err = pool.Exec(ctx, "DELETE FROM idempotency_keys")
+	require.NoError(t, err, "failed to clean idempotency_keys table")
 	_, err = pool.Exec(ctx, "DELETE FROM transactions")
 	require.NoError(t, err, "failed to clean transactions table")
 	_, err = pool.Exec(ctx, "DELETE FROM accounts")
@@ -275,6 +278,70 @@ func TestHTTPIntegration(t *testing.T) {
 		})
 	})
 
+	t.Run("idempotent transfers", func(t *testing.T) {
+		srcID := int64(11001)
+		dstID := int64(11002)
+
+		resp := makeRequest(t, client, "POST", baseURL+"/accounts",
+			map[string]any{"account_id": srcID, "initial_balance": "1000.00000"})
+		require.Equal(t, http.StatusNoContent, resp.StatusCode)
+		resp.Body.Close()
+		resp = makeRequest(t, client, "POST", baseURL+"/accounts",
+			map[string]any{"account_id": dstID, "initial_balance": "0.00000"})
+		require.Equal(t, http.StatusNoContent, resp.StatusCode)
+		resp.Body.Close()
+
+		// post issues POST /transactions with an optional Idempotency-Key header.
+		post := func(amount, key string) *http.Response {
+			jsonData, err := json.Marshal(map[string]any{
+				"source_account_id":      srcID,
+				"destination_account_id": dstID,
+				"amount":                 amount,
+			})
+			require.NoError(t, err)
+			req, err := http.NewRequest("POST", baseURL+"/transactions", bytes.NewBuffer(jsonData))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/json")
+			if key != "" {
+				req.Header.Set("Idempotency-Key", key)
+			}
+			r, err := client.Do(req)
+			require.NoError(t, err)
+			return r
+		}
+
+		// First call: 200 with a real transaction id.
+		resp = post("250.00000", "http-key-1")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var first createTxResp
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&first))
+		resp.Body.Close()
+		assert.Greater(t, first.ID, int64(0))
+
+		// Exact-duplicate retry: 200 with the SAME id, and no extra money movement.
+		resp = post("250.00000", "http-key-1")
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var second createTxResp
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&second))
+		resp.Body.Close()
+		assert.Equal(t, first.ID, second.ID, "retry must return the original transaction id")
+
+		srcAccount := getAccount(t, client, baseURL, srcID)
+		assert.Equal(t, "750.00000", srcAccount.Balance, "money must have moved exactly once")
+
+		// Same key, different payload: 409 conflict.
+		resp = post("300.00000", "http-key-1")
+		require.Equal(t, http.StatusConflict, resp.StatusCode)
+		var errResp map[string]string
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&errResp))
+		resp.Body.Close()
+		assert.Equal(t, "conflict", errResp["error"])
+
+		// Conflict moved no money.
+		srcAccount = getAccount(t, client, baseURL, srcID)
+		assert.Equal(t, "750.00000", srcAccount.Balance, "conflict must not move money")
+	})
+
 	t.Run("health check", func(t *testing.T) {
 		resp, err := client.Get(baseURL + "/health")
 		require.NoError(t, err)
@@ -316,6 +383,10 @@ func makeRequest(t *testing.T, client *http.Client, method, url string, body any
 type accountResponse struct {
 	AccountID int64  `json:"account_id"`
 	Balance   string `json:"balance"`
+}
+
+type createTxResp struct {
+	ID int64 `json:"id"`
 }
 
 // getAccount is a helper function to get account details

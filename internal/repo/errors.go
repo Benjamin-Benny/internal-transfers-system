@@ -8,4 +8,6 @@ var (
 	ErrInsufficientFunds    = errors.New("insufficient funds")
 	ErrInvalidAmount        = errors.New("invalid amount")
 	ErrSameAccount          = errors.New("source and destination accounts cannot be the same")
+	// ErrIdempotencyKeyConflict means an Idempotency-Key was reused with a different payload.
+	ErrIdempotencyKeyConflict = errors.New("idempotency key reused with a different payload")
 )

@@ -11,9 +11,10 @@ import (
 
 // mockAccountRepo is a simple mock implementation of AccountRepo
 type mockAccountRepo struct {
-	createAccountFunc func(ctx context.Context, accountID int64, initialBalance decimal.Decimal) error
-	getAccountFunc    func(ctx context.Context, accountID int64) (repo.Account, error)
-	transferTxFunc    func(ctx context.Context, sourceID, destID int64, amount decimal.Decimal) error
+	createAccountFunc        func(ctx context.Context, accountID int64, initialBalance decimal.Decimal) error
+	getAccountFunc           func(ctx context.Context, accountID int64) (repo.Account, error)
+	transferTxFunc           func(ctx context.Context, sourceID, destID int64, amount decimal.Decimal) error
+	transferTxIdempotentFunc func(ctx context.Context, sourceID, destID int64, amount decimal.Decimal, key string) (int64, error)
 }
 
 func (m *mockAccountRepo) CreateAccount(ctx context.Context, accountID int64, initialBalance decimal.Decimal) error {
@@ -35,6 +36,13 @@ func (m *mockAccountRepo) TransferTx(ctx context.Context, sourceID, destID int64
 		return m.transferTxFunc(ctx, sourceID, destID, amount)
 	}
 	return nil
+}
+
+func (m *mockAccountRepo) TransferTxIdempotent(ctx context.Context, sourceID, destID int64, amount decimal.Decimal, key string) (int64, error) {
+	if m.transferTxIdempotentFunc != nil {
+		return m.transferTxIdempotentFunc(ctx, sourceID, destID, amount, key)
+	}
+	return 0, nil
 }
 
 func TestCreateAccount(t *testing.T) {
@@ -505,6 +513,59 @@ func TestCreateTransaction(t *testing.T) {
 		}
 		if !errors.Is(err, unknownErr) {
 			t.Errorf("expected wrapped error to contain original error")
+		}
+	})
+}
+
+func TestCreateTransactionIdempotent(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("returns the transaction id and forwards the key", func(t *testing.T) {
+		mockRepo := &mockAccountRepo{
+			transferTxIdempotentFunc: func(ctx context.Context, sourceID, destID int64, amount decimal.Decimal, key string) (int64, error) {
+				if key != "abc-123" {
+					t.Errorf("expected key abc-123, got %q", key)
+				}
+				return 42, nil
+			},
+		}
+
+		svc := New(mockRepo)
+		id, err := svc.CreateTransactionIdempotent(ctx, 100, 200, "50.00", "abc-123")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if id != 42 {
+			t.Errorf("expected transaction id 42, got %d", id)
+		}
+	})
+
+	t.Run("validates input before touching the repo", func(t *testing.T) {
+		mockRepo := &mockAccountRepo{
+			transferTxIdempotentFunc: func(ctx context.Context, sourceID, destID int64, amount decimal.Decimal, key string) (int64, error) {
+				t.Error("repo should not be called on invalid input")
+				return 0, nil
+			},
+		}
+
+		svc := New(mockRepo)
+		_, err := svc.CreateTransactionIdempotent(ctx, 100, 100, "50.00", "abc-123") // same account
+		if !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("expected ErrInvalidInput, got %v", err)
+		}
+	})
+
+	t.Run("maps a reused-key payload conflict to ErrConflict", func(t *testing.T) {
+		mockRepo := &mockAccountRepo{
+			transferTxIdempotentFunc: func(ctx context.Context, sourceID, destID int64, amount decimal.Decimal, key string) (int64, error) {
+				return 0, repo.ErrIdempotencyKeyConflict
+			},
+		}
+
+		svc := New(mockRepo)
+		_, err := svc.CreateTransactionIdempotent(ctx, 100, 200, "50.00", "abc-123")
+		if !errors.Is(err, ErrConflict) {
+			t.Errorf("expected ErrConflict, got %v", err)
 		}
 	})
 }

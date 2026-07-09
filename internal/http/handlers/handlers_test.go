@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/benjaminbenny/internal-transfers-system/internal/service"
+	"github.com/go-chi/chi/v5"
 )
 
 // serviceInterface defines the interface that handlers depend on
@@ -20,13 +20,15 @@ type serviceInterface interface {
 	CreateAccount(ctx context.Context, accountID int64, initialBalance string) error
 	GetAccount(ctx context.Context, accountID int64) (service.Account, error)
 	CreateTransaction(ctx context.Context, sourceID, destID int64, amount string) error
+	CreateTransactionIdempotent(ctx context.Context, sourceID, destID int64, amount, key string) (int64, error)
 }
 
 // mockService is a mock implementation of the service interface for testing
 type mockService struct {
-	createAccountFunc     func(ctx context.Context, accountID int64, initialBalance string) error
-	getAccountFunc        func(ctx context.Context, accountID int64) (service.Account, error)
-	createTransactionFunc func(ctx context.Context, sourceID, destID int64, amount string) error
+	createAccountFunc               func(ctx context.Context, accountID int64, initialBalance string) error
+	getAccountFunc                  func(ctx context.Context, accountID int64) (service.Account, error)
+	createTransactionFunc           func(ctx context.Context, sourceID, destID int64, amount string) error
+	createTransactionIdempotentFunc func(ctx context.Context, sourceID, destID int64, amount, key string) (int64, error)
 }
 
 func (m *mockService) CreateAccount(ctx context.Context, accountID int64, initialBalance string) error {
@@ -48,6 +50,13 @@ func (m *mockService) CreateTransaction(ctx context.Context, sourceID, destID in
 		return m.createTransactionFunc(ctx, sourceID, destID, amount)
 	}
 	return nil
+}
+
+func (m *mockService) CreateTransactionIdempotent(ctx context.Context, sourceID, destID int64, amount, key string) (int64, error) {
+	if m.createTransactionIdempotentFunc != nil {
+		return m.createTransactionIdempotentFunc(ctx, sourceID, destID, amount, key)
+	}
+	return 0, nil
 }
 
 // testAccountsHandler is a version of AccountsHandler that accepts an interface for testing
@@ -112,6 +121,17 @@ func (h *testTransactionsHandler) HandleCreateTransaction(w http.ResponseWriter,
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeInvalidJSON(w)
+		return
+	}
+
+	if key := r.Header.Get("Idempotency-Key"); key != "" {
+		id, err := h.svc.CreateTransactionIdempotent(r.Context(), req.SourceAccountID, req.DestinationAccountID, req.Amount, key)
+		if err != nil {
+			status, code := mapError(err)
+			writeError(w, status, code)
+			return
+		}
+		writeJSON(w, http.StatusOK, createTransactionResponse{ID: id})
 		return
 	}
 
@@ -416,9 +436,73 @@ func TestTransactionsHandler_HandleCreateTransaction_InsufficientFunds(t *testin
 	}
 }
 
+func TestTransactionsHandler_Idempotency_ReturnsID(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	var gotKey string
+	mock := &mockService{
+		createTransactionIdempotentFunc: func(ctx context.Context, sourceID, destID int64, amount, key string) (int64, error) {
+			gotKey = key
+			return 777, nil
+		},
+	}
+	handler := &testTransactionsHandler{svc: mock, logger: logger}
+
+	body := `{"source_account_id": 123, "destination_account_id": 456, "amount": "100.00000"}`
+	req := httptest.NewRequest(http.MethodPost, "/transactions", bytes.NewBufferString(body))
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+
+	handler.HandleCreateTransaction(rec, req)
+
+	// With a key present, the handler returns 200 + the transaction id (not 204).
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", rec.Code)
+	}
+	if gotKey != "key-1" {
+		t.Errorf("handler did not forward the Idempotency-Key header, got %q", gotKey)
+	}
+
+	var response createTransactionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if response.ID != 777 {
+		t.Errorf("expected id 777, got %d", response.ID)
+	}
+}
+
+func TestTransactionsHandler_Idempotency_PayloadConflict(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	mock := &mockService{
+		createTransactionIdempotentFunc: func(ctx context.Context, sourceID, destID int64, amount, key string) (int64, error) {
+			return 0, service.ErrConflict // key reused with a different payload
+		},
+	}
+	handler := &testTransactionsHandler{svc: mock, logger: logger}
+
+	body := `{"source_account_id": 123, "destination_account_id": 456, "amount": "100.00000"}`
+	req := httptest.NewRequest(http.MethodPost, "/transactions", bytes.NewBufferString(body))
+	req.Header.Set("Idempotency-Key", "key-1")
+	rec := httptest.NewRecorder()
+
+	handler.HandleCreateTransaction(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("expected status 409, got %d", rec.Code)
+	}
+
+	var response map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if response["error"] != "conflict" {
+		t.Errorf("expected error 'conflict', got '%s'", response["error"])
+	}
+}
+
 func TestAccountsHandler_HandleCreateAccount_InvalidInput(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	
+
 	testCases := []struct {
 		name string
 		body string
@@ -436,7 +520,7 @@ func TestAccountsHandler_HandleCreateAccount_InvalidInput(t *testing.T) {
 			body: `{"account_id": 0, "initial_balance": "100.00000"}`,
 		},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := &mockService{
@@ -445,21 +529,21 @@ func TestAccountsHandler_HandleCreateAccount_InvalidInput(t *testing.T) {
 				},
 			}
 			handler := &testAccountsHandler{svc: mock, logger: logger}
-			
+
 			req := httptest.NewRequest(http.MethodPost, "/accounts", bytes.NewBufferString(tc.body))
 			rec := httptest.NewRecorder()
-			
+
 			handler.HandleCreateAccount(rec, req)
-			
+
 			if rec.Code != http.StatusBadRequest {
 				t.Errorf("expected status 400, got %d", rec.Code)
 			}
-			
+
 			var response map[string]string
 			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 				t.Fatalf("failed to unmarshal response: %v", err)
 			}
-			
+
 			if response["error"] != "invalid_input" {
 				t.Errorf("expected error 'invalid_input', got '%s'", response["error"])
 			}

@@ -122,6 +122,42 @@ curl http://localhost:8080/accounts/102
 # {"account_id":102,"balance":"750.75000"}
 ```
 
+### Idempotent Transfers (optional extension)
+
+`POST /transactions` accepts an **optional** `Idempotency-Key` header so a retried request
+never double-applies a transfer. Behavior without the header is unchanged (`204 No Content`).
+
+```bash
+# With a key, the transfer is deduplicated and the created transaction id is returned (200).
+curl -X POST http://localhost:8080/transactions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7c1f...-unique-per-attempt" \
+  -d '{"source_account_id": 101, "destination_account_id": 102, "amount": "250.75000"}'
+# HTTP 200 {"id": 42}
+
+# Retrying the SAME key with the SAME body returns the SAME id and moves no money again.
+# (identical command as above)
+# HTTP 200 {"id": 42}
+
+# Reusing the SAME key with a DIFFERENT body is rejected.
+curl -X POST http://localhost:8080/transactions \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7c1f...-unique-per-attempt" \
+  -d '{"source_account_id": 101, "destination_account_id": 102, "amount": "999.00000"}'
+# HTTP 409 {"error":"conflict"}
+```
+
+**How it works:** an `idempotency_keys` table (`key` PK → `transaction_id`) is written inside
+the *same* database transaction as the transfer, so the dedup decision and the money movement
+commit atomically. On a repeat key the original transaction is looked up and its payload is
+compared against the retry (via the foreign key to `transactions`); a match returns the original
+id, a mismatch returns `409 conflict`.
+
+**Tradeoff (intentional):** this is slightly beyond the minimal spec. It is included because
+retries are unavoidable in payments — a client that times out and retries must not move money
+twice — and the cost is small: one nullable-free table, one header, and an additive code path
+that leaves the no-key behavior (and the original API contract) exactly as before.
+
 ### Error Examples
 
 **Account Not Found (404)**

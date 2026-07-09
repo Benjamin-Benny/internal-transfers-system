@@ -72,37 +72,56 @@ func (s *Service) GetAccount(ctx context.Context, accountID int64) (Account, err
 	}, nil
 }
 
-// CreateTransaction executes a transfer between two accounts
-func (s *Service) CreateTransaction(ctx context.Context, sourceID, destID int64, amountStr string) error {
-	// Validate account IDs
+// validateTransfer applies the shared transfer input rules and returns the parsed amount.
+// Both the plain and idempotent paths use it so validation stays identical.
+func (s *Service) validateTransfer(sourceID, destID int64, amountStr string) (decimal.Decimal, error) {
 	if sourceID <= 0 {
-		return fmt.Errorf("%w: source account ID must be positive", ErrInvalidInput)
+		return decimal.Zero, fmt.Errorf("%w: source account ID must be positive", ErrInvalidInput)
 	}
 	if destID <= 0 {
-		return fmt.Errorf("%w: destination account ID must be positive", ErrInvalidInput)
+		return decimal.Zero, fmt.Errorf("%w: destination account ID must be positive", ErrInvalidInput)
 	}
 	if sourceID == destID {
-		return fmt.Errorf("%w: source and destination accounts must be different", ErrInvalidInput)
+		return decimal.Zero, fmt.Errorf("%w: source and destination accounts must be different", ErrInvalidInput)
 	}
 
-	// Parse and validate amount
 	amount, err := ParseAmount(amountStr)
+	if err != nil {
+		return decimal.Zero, err
+	}
+	if amount.LessThanOrEqual(decimal.Zero) {
+		return decimal.Zero, fmt.Errorf("%w: transfer amount must be positive", ErrInvalidInput)
+	}
+	return amount, nil
+}
+
+// CreateTransaction executes a transfer between two accounts (no idempotency).
+func (s *Service) CreateTransaction(ctx context.Context, sourceID, destID int64, amountStr string) error {
+	amount, err := s.validateTransfer(sourceID, destID, amountStr)
 	if err != nil {
 		return err
 	}
 
-	// Validate positive amount
-	if amount.LessThanOrEqual(decimal.Zero) {
-		return fmt.Errorf("%w: transfer amount must be positive", ErrInvalidInput)
-	}
-
-	// Execute transfer
-	err = s.repo.TransferTx(ctx, sourceID, destID, amount)
-	if err != nil {
+	if err := s.repo.TransferTx(ctx, sourceID, destID, amount); err != nil {
 		return mapRepoError(err)
 	}
-
 	return nil
+}
+
+// CreateTransactionIdempotent executes a transfer that is safe to retry under the given key and
+// returns the resulting transaction id. A retry with the same key and payload returns the
+// original id without moving money; the same key with a different payload returns ErrConflict.
+func (s *Service) CreateTransactionIdempotent(ctx context.Context, sourceID, destID int64, amountStr, key string) (int64, error) {
+	amount, err := s.validateTransfer(sourceID, destID, amountStr)
+	if err != nil {
+		return 0, err
+	}
+
+	id, err := s.repo.TransferTxIdempotent(ctx, sourceID, destID, amount, key)
+	if err != nil {
+		return 0, mapRepoError(err)
+	}
+	return id, nil
 }
 
 // mapRepoError maps repository errors to service-level errors
@@ -119,6 +138,8 @@ func mapRepoError(err error) error {
 		return ErrConflict
 	case errors.Is(err, repo.ErrInsufficientFunds):
 		return ErrInsufficientFunds
+	case errors.Is(err, repo.ErrIdempotencyKeyConflict):
+		return ErrConflict
 	case errors.Is(err, repo.ErrInvalidAmount):
 		return ErrInvalidInput
 	case errors.Is(err, repo.ErrSameAccount):
