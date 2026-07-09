@@ -1,13 +1,11 @@
 # Design Notes — Internal Transfers System
 
-Audience: a reviewer reading the code, and a CTO deciding whether this scales to a licensed
-payment institution. This documents the load-bearing decisions, the honest limits of the
-simple version that ships here, and the production direction with tradeoffs. It is deliberately
-not marketing — where the simple choice is a placeholder, it says so.
+This document records the load-bearing design decisions, the limits of the version that ships
+here, and the production direction with tradeoffs.
 
 The system is a small Go service (chi → service → repo → Postgres) exposing account creation,
 balance reads, and transfers, with money held as `NUMERIC(20,5)` and moved inside a single
-serialized database transaction.
+database transaction.
 
 ---
 
@@ -172,7 +170,7 @@ slightly heavier contract for much better client ergonomics and supportability.
 ## 5. Idempotency — optional, atomic, opt-in
 
 **Choice.** `POST /transactions` accepts an optional `Idempotency-Key` header. Without it,
-behavior is unchanged (204, spec preserved). With it, the transfer is deduplicated: the key
+the base transfer behavior is unchanged (204). With it, the transfer is deduplicated: the key
 lookup, the transfer, and the key insert all happen **in the same database transaction** as the
 money movement, so the dedup decision and the debit/credit commit or roll back together. A
 repeat key with the same payload returns the original transaction id (no money moved); a repeat
@@ -182,8 +180,8 @@ so retries are verifiable and the ledger is auditable.
 **Why it's here.** Retries are unavoidable in payments — a client that times out cannot tell
 "never happened" from "happened but I didn't hear back," so it *must* retry, and a naive retry
 double-applies the transfer. Idempotency is the standard remedy and is cheap: one table, one
-optional header, an additive code path. It's slightly beyond the minimal spec; I added it
-because omitting it would be a known correctness gap in the one operation that moves money.
+optional header, an additive code path. It's an addition beyond the base transfer endpoint; I
+added it because omitting it would be a known correctness gap in the one operation that moves money.
 
 **Limitation of the simple version.** Keys never expire (no TTL/GC) and aren't scoped to a
 caller; we compare payloads via the transaction the key produced rather than storing the exact
@@ -202,8 +200,8 @@ lock/`ON CONFLICT` fast path to avoid the wasted transfer attempt on the loser.
 - **Double-entry ledger (§2)** — the highest-value change; convert `transactions` into
   append-only `entries` with a debit=credit invariant and balance-as-projection, with a
   reconciliation job.
-- **Switch balance reads in the transfer to `FOR NO KEY UPDATE`** (see Q&A) after measuring, to
-  reduce contention with FK-referencing inserts.
+- **Switch balance reads in the transfer to `FOR NO KEY UPDATE`** (see the Design FAQ) after
+  measuring, to reduce contention with FK-referencing inserts.
 - **Structured errors (problem+json)** with correlation ids threaded through slog.
 - **Input hardening:** amount upper-bound → 400; per-currency scale.
 - **Observability:** request metrics, DB pool metrics, a `/health` that checks DB readiness, and
@@ -214,7 +212,7 @@ lock/`ON CONFLICT` fast path to avoid the wasted transfer attempt on the loser.
 
 ---
 
-## Q&A — questions a senior reviewer would ask
+## Design FAQ
 
 **Q1. What happens if two transfers deadlock?**
 Between transfers, they can't: both lock the lower `account_id` first, so there's no cycle. If a
@@ -279,8 +277,8 @@ schema invariant rather than an application hope.
 **Q8. Why NUMERIC + decimal instead of integer minor units?**
 Both are correct; neither is float. Integer minor units (store cents/satoshis as `bigint`) are
 unambiguous about scale and faster, but require a currency+scale lookup to interpret and are less
-readable in the DB. `NUMERIC(20,5)` + `shopspring/decimal` gave exact base-10 arithmetic against
-a fixed 5-dp contract with readable storage, which fit this exercise. For multi-currency at scale
+readable in the DB. `NUMERIC(20,5)` + `shopspring/decimal` gave exact base-10 arithmetic with
+readable storage, which fits this system's fixed 5-dp, single-currency contract. For multi-currency at scale
 I'd seriously consider integer minor units with an explicit per-currency scale. The
 non-negotiable part is only that it's never `float`.
 

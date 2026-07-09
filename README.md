@@ -2,11 +2,35 @@
 
 A high-performance HTTP API for managing internal account transfers with atomic transaction guarantees and precise decimal handling.
 
+## Assumptions
+
+These reflect what the code actually enforces:
+
+- **Single shared currency.** Accounts and amounts carry no currency field; every balance and
+  transfer is in one implicit currency.
+- **No authentication or authorization.** The service is intended to run inside a trusted
+  internal network; no endpoint performs auth.
+- **Client-supplied account IDs.** `account_id` is provided by the caller when creating an
+  account (not server-generated), must be a positive integer, and is the primary key.
+- **Fixed-scale decimal money.** Amounts and balances allow up to 5 decimal places and are
+  stored and returned normalized to exactly 5 (e.g. `"100.00000"`). Values are exchanged as
+  JSON strings; scientific notation and more than 5 decimal places are rejected as
+  `invalid_input`.
+- **Non-negative balances.** `initial_balance` may be zero but not negative, and a transfer
+  cannot overdraw its source; a `CHECK (balance >= 0)` constraint backs the in-code funds check.
+- **Positive transfer amounts.** A transfer `amount` must be greater than zero.
+- **Accounts must pre-exist.** A transfer never creates accounts; if the source or destination
+  is missing it returns `not_found` (404). Source and destination must differ.
+- **Idempotency is opt-in.** `POST /transactions` is deduplicated only when an `Idempotency-Key`
+  header is sent; without it the transfer runs normally and returns `204`.
+- **Create and read only.** Accounts and transactions can be created and read; there are no
+  update, delete, or list endpoints.
+
 ## Quick Start
 
 ### Prerequisites
 
-- **Go 1.20+** - [Download](https://go.dev/dl/)
+- **Go 1.25.6+** - [Download](https://go.dev/dl/)
 - **Docker & Docker Compose** - [Get Docker](https://docs.docker.com/get-docker/)
 - **golang-migrate** - Database migration tool
 
@@ -24,7 +48,7 @@ sudo mv migrate /usr/local/bin/
 ### Setup
 
 ```bash
-# 1. Clone and install dependencies
+# 1. Install dependencies (run from the project root)
 go mod download
 
 # 2. Start PostgreSQL
@@ -153,10 +177,10 @@ commit atomically. On a repeat key the original transaction is looked up and its
 compared against the retry (via the foreign key to `transactions`); a match returns the original
 id, a mismatch returns `409 conflict`.
 
-**Tradeoff (intentional):** this is slightly beyond the minimal spec. It is included because
+**Tradeoff (intentional):** this goes beyond the base transfer endpoint. It is included because
 retries are unavoidable in payments — a client that times out and retries must not move money
 twice — and the cost is small: one nullable-free table, one header, and an additive code path
-that leaves the no-key behavior (and the original API contract) exactly as before.
+that leaves the no-key behavior (and the base API contract) exactly as before.
 
 ### Error Examples
 
@@ -258,14 +282,13 @@ Configure via environment variables (see `.env.example`):
 
 ```
 .
-├── cmd/server/          # Application entrypoint
+├── cmd/server/          # Application entrypoint (main.go)
 ├── internal/
-│   ├── config/          # Configuration management
-│   ├── db/              # Database connection pool
-│   ├── domain/          # Domain models and business logic
-│   ├── http/            # HTTP server, handlers, middleware
-│   ├── repo/            # Data access layer
-│   └── service/         # Business services
-├── migrations/          # SQL migrations
+│   ├── config/          # Configuration from environment variables
+│   ├── db/              # PostgreSQL connection pool
+│   ├── http/            # HTTP server, router, handlers, middleware
+│   ├── repo/            # Data access layer (SQL, transactions)
+│   └── service/         # Business logic and validation
+├── migrations/          # SQL migrations (golang-migrate)
 └── docker-compose.yml   # PostgreSQL container
 ```
