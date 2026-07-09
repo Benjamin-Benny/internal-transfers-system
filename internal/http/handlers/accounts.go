@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/benjaminbenny/internal-transfers-system/internal/service"
+	"github.com/go-chi/chi/v5"
 )
 
 // AccountsHandler handles account-related endpoints.

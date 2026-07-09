@@ -4,13 +4,13 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/benjaminbenny/internal-transfers-system/internal/http/handlers"
 	custommw "github.com/benjaminbenny/internal-transfers-system/internal/http/middleware"
 	"github.com/benjaminbenny/internal-transfers-system/internal/repo"
 	"github.com/benjaminbenny/internal-transfers-system/internal/service"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // NewRouter creates and configures the chi router with all routes and middleware.

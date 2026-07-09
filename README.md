@@ -262,8 +262,11 @@ make test
 make db-up
 make migrate-up
 
-# Run with integration tests enabled
-RUN_INTEGRATION=1 DATABASE_URL="postgres://app:app@localhost:5432/transfers?sslmode=disable" go test ./... -v
+# Run with integration tests enabled.
+# -p 1 runs the package test binaries serially: the integration tests share a single
+# Postgres instance, so running them in parallel would let one package's cleanup race
+# another package's inserts.
+RUN_INTEGRATION=1 DATABASE_URL="postgres://app:app@localhost:5432/transfers?sslmode=disable" go test -race -p 1 ./... -v
 ```
 
 Without `RUN_INTEGRATION=1`, integration tests are automatically skipped.

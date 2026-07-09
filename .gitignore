@@ -56,3 +56,6 @@ Temporary Items
 /bin/
 /dist/
 *.log
+
+# compiled server binary
+/server

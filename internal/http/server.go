@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/benjaminbenny/internal-transfers-system/internal/config"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // NewServer creates and configures a new HTTP server with appropriate timeouts.

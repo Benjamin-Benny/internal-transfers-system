@@ -18,11 +18,11 @@ func NewPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	}
 
 	// Set reasonable pool defaults
-	config.MaxConns = 25                          // Maximum number of connections
-	config.MinConns = 5                           // Minimum number of connections
-	config.MaxConnLifetime = time.Hour            // Max lifetime of a connection
-	config.MaxConnIdleTime = 30 * time.Minute     // Max idle time before closing
-	config.HealthCheckPeriod = time.Minute        // Periodic health check interval
+	config.MaxConns = 25                               // Maximum number of connections
+	config.MinConns = 5                                // Minimum number of connections
+	config.MaxConnLifetime = time.Hour                 // Max lifetime of a connection
+	config.MaxConnIdleTime = 30 * time.Minute          // Max idle time before closing
+	config.HealthCheckPeriod = time.Minute             // Periodic health check interval
 	config.ConnConfig.ConnectTimeout = 5 * time.Second // Connection timeout
 
 	// Create the connection pool

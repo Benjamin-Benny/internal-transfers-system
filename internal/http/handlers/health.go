@@ -17,6 +17,6 @@ func (h *HealthHandler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	response := map[string]string{
 		"status": "ok",
 	}
-	
+
 	writeJSON(w, http.StatusOK, response)
 }
